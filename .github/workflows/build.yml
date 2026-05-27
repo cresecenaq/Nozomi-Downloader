@@ -1,0 +1,61 @@
+name: Build Nozomi Downloader
+
+# Запускать сборку каждый раз, когда ты загружаешь новый код, или вручную по кнопке
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: 
+
+jobs:
+  build:
+    # Запускаем две параллельные машины: одну на Windows, одну на Linux (Ubuntu)
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    # 1. Скачиваем твой код на сервер
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 2. Устанавливаем Python
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    # 3. Устанавливаем твои библиотеки
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install PyQt6 PyQt6-WebEngine requests pyinstaller
+
+    # 4. Собираем .exe для Windows (используем точку с запятой ; и добавляем иконку)
+    - name: Build for Windows
+      if: matrix.os == 'windows-latest'
+      run: |
+        pyinstaller --noconsole --onefile --add-data "icons;icons" --icon="app.ico" main.py
+
+    # 5. Собираем бинарник для Linux (используем двоеточие : )
+    - name: Build for Linux
+      if: matrix.os == 'ubuntu-latest'
+      run: |
+        pyinstaller --noconsole --onefile --add-data "icons:icons" main.py
+
+    # 6. Сохраняем готовый файл для Windows, чтобы ты мог его скачать
+    - name: Upload Windows Artifact
+      if: matrix.os == 'windows-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Nozomi_Windows_App
+        path: dist/main.exe
+
+    # 7. Сохраняем готовый файл для Linux, чтобы ты мог его скачать
+    - name: Upload Linux Artifact
+      if: matrix.os == 'ubuntu-latest'
+      uses: actions/upload-artifact@v4
+      with:
+        name: Nozomi_Linux_App
+        path: dist/main
