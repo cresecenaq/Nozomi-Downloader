@@ -30,10 +30,10 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: windows-executable
-        path: dist/Nozomi Downloader.exe
+        path: "dist/Nozomi Downloader.exe"
 
   build-linux-appimage:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-22.04
     steps:
     - name: Скачивание исходного кода
       uses: actions/checkout@v4
@@ -78,10 +78,10 @@ jobs:
         export APPIMAGE_EXTRACT_AND_RUN=1
         ARCH=x86_64 ./appimagetool-x86_64.AppImage AppDir
         mkdir -p final_dist
-        mv *.AppImage final_dist/Nozomi Downloader.AppImage
+        mv *.AppImage "final_dist/Nozomi Downloader.AppImage"
 
     - name: Сохранение
       uses: actions/upload-artifact@v4
       with:
         name: linux-appimage
-        path: final_dist/Nozomi Downloader.AppImage
+        path: "final_dist/Nozomi Downloader.AppImage"
