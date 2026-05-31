@@ -1,13 +1,17 @@
 import sys
 import os
 import re
+import time
 import requests
 import urllib.parse
 from html import escape, unescape
 from urllib.parse import urljoin, urlparse, unquote
-from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QListWidget, QStackedWidget, QSizePolicy, QListWidgetItem
+from requests.adapters import HTTPAdapter
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from PyQt6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QTextEdit, QLabel, QListWidget, QStackedWidget, QSizePolicy, QListWidgetItem, QProgressBar
 from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtCore import QUrl, QTimer, QThread, pyqtSignal, Qt, QSize
+from PyQt6.QtWebEngineCore import QWebEngineSettings
+from PyQt6.QtCore import QUrl, QTimer, QThread, pyqtSignal, Qt, QSize, QObject
 from PyQt6.QtGui import QPainter, QColor, QBrush, QPainterPath, QPen, QIcon, QPixmap, QCursor, QClipboard
 
 
@@ -19,6 +23,13 @@ REQUEST_HEADERS = {
     "Referer": "https://nozomi.la/",
 }
 
+
+class ArtistRequestEmitter(QObject):
+    request_artist = pyqtSignal(str)
+
+
+artist_request_emitter = ArtistRequestEmitter()
+artist_cache = {}
 
 
 def resource_path(relative_path):
@@ -77,10 +88,15 @@ def extract_media_links_from_post(session, post_url):
             else:
                 media_links.append(f"https://w.gold-usergeneratedcontent.net/{media_path}.webp")
 
+        artist_request_emitter.request_artist.emit(post_url)
+
         return media_links
 
     response = session.get(post_url, timeout=20)
     response.raise_for_status()
+
+    artist_request_emitter.request_artist.emit(post_url)
+
     return extract_media_links(post_url, response.text)
 
 
@@ -126,48 +142,111 @@ def extract_media_links(post_url, html):
     return full_size_links or media_links
 
 
-def media_filename(media_url, post_url, index):
+DOWNLOAD_CHUNK_SIZE = 65536
+
+
+def get_clean_post_url(post_url):
+    return post_url.split('#')[0]
+
+
+def prepare_session():
+    session = requests.Session()
+    session.headers.update(REQUEST_HEADERS)
+    adapter = HTTPAdapter(pool_connections=10, pool_maxsize=20)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def ensure_artist_for_post_url(post_url, timeout=10.0):
+    clean_url = get_clean_post_url(post_url)
+    if clean_url in artist_cache:
+        return artist_cache[clean_url]
+
+    artist_request_emitter.request_artist.emit(clean_url)
+    waited = 0.0
+    while waited < timeout:
+        if clean_url in artist_cache:
+            return artist_cache[clean_url]
+        time.sleep(0.2)
+        waited += 0.2
+
+    return artist_cache.get(clean_url, [])
+
+
+def sanitize_artist_prefix(artists):
+    if not artists:
+        return ""
+
+    safe_names = []
+    for artist in artists:
+        if not artist:
+            continue
+        name = unquote(artist).strip()
+        name = re.sub(r'[<>:"/\\|?*]+', "_", name)
+        name = re.sub(r"\s+", "_", name)
+        if name:
+            safe_names.append(name)
+
+    if not safe_names:
+        return ""
+
+    prefix = "+".join(safe_names)
+    if len(prefix) > 120:
+        prefix = prefix[:120].rstrip("+_")
+
+    return prefix + "_"
+
+
+def media_filename(media_url, post_url):
     url_path = urlparse(media_url).path
     filename = os.path.basename(url_path)
+    ext = os.path.splitext(filename)[1]
 
     match = re.search(r"/post/(\d+)", post_url)
     post_id = match.group(1) if match else "post"
 
-    if not os.path.splitext(filename)[1]:
-        filename = f"{post_id}_{index}.bin"
-    elif len(filename) < 8:
-        ext = os.path.splitext(filename)[1]
-        filename = f"{post_id}_{index}{ext}"
-    else:
-        filename = f"{post_id}_{filename}"
+    if not ext:
+        ext = ".bin"
+        
+    filename = f"{post_id}{ext}"
 
+    clean_url = get_clean_post_url(post_url)
+    artists = artist_cache.get(clean_url)
+    if artists is None:
+        artists = ensure_artist_for_post_url(post_url, timeout=10.0)
+
+    prefix = sanitize_artist_prefix(artists)
     filename = unquote(filename).strip()
     filename = re.sub(r'[<>:"/\\|?*]+', "_", filename)
+    filename = prefix + filename
     return filename[:180] or "downloaded_file"
 
 
-def download_link_media(session, link, save_dir, index, total, log_callback, should_stop=None):
+def download_link_media(session, link, save_dir, log_callback, should_stop=None):
     if should_stop and should_stop():
         return 0
 
     if urlparse(link).path.lower().endswith(MEDIA_EXTENSIONS):
         media_links = [link]
     else:
-        log_callback(f"[{index}/{total}] Ищю медиа в ссылке: {link}")
-        media_links = extract_media_links_from_post(session, link)
+        try:
+            media_links = extract_media_links_from_post(session, link)
+        except Exception as e:
+            log_callback(f"Ошибка при парсинге ссылки {link}: {e}")
+            return 0
 
     if not media_links:
-        log_callback(f"[{index}/{total}] Медиа не найдено: {link}")
+        log_callback(f"Ошибка: Медиа не найдено по ссылке: {link}")
         return 0
 
     downloaded = 0
-    log_callback(f"[{index}/{total}] Найдено медиа: {len(media_links)}")
 
     for media_index, media_url in enumerate(media_links, 1):
         if should_stop and should_stop():
             return downloaded
 
-        file_name = media_filename(media_url, link, media_index)
+        file_name = media_filename(media_url, link)
         
         ext = os.path.splitext(file_name)[1].lower().replace('.', '')
         if not ext:
@@ -186,24 +265,25 @@ def download_link_media(session, link, save_dir, index, total, log_callback, sho
 
         file_path = path
 
-        response = session.get(media_url, stream=True, timeout=30)
-        response.raise_for_status()
+        try:
+            response = session.get(media_url, stream=True, timeout=30)
+            response.raise_for_status()
 
-        with open(file_path, 'wb') as out_file:
-            for chunk in response.iter_content(chunk_size=8192):
-                if should_stop and should_stop():
-                    out_file.close()
-                    try:
-                        os.remove(file_path)
-                    except:
-                        pass
-                    return downloaded
-                
-                if chunk:
-                    out_file.write(chunk)
-
-        downloaded += 1
-        log_callback(f"  └─ Медиа загружено: [{ext.upper()}]")
+            with open(file_path, 'wb') as out_file:
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                    if should_stop and should_stop():
+                        out_file.close()
+                        try:
+                            os.remove(file_path)
+                        except:
+                            pass
+                        return downloaded
+                    
+                    if chunk:
+                        out_file.write(chunk)
+            downloaded += 1
+        except Exception as e:
+            log_callback(f"Ошибка при скачивании файла {media_url}: {e}")
 
     return downloaded
 
@@ -253,6 +333,7 @@ def format_log_text(text):
 
 class DownloadThread(QThread):
     log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
     finished_signal = pyqtSignal()
 
     def __init__(self, links):
@@ -275,38 +356,38 @@ class DownloadThread(QThread):
         save_dir = "downloads"
         os.makedirs(save_dir, exist_ok=True)
         
-        self.log_signal.emit(f"Найдено {len(links)} ссылок, начинаю загрузку в папку '{save_dir}'")
-        self.log_signal.emit("-" * 30)
+        total_links = len(links)
+        self.progress_signal.emit(0, total_links)
+        
+        completed_links = 0
 
-        session = requests.Session()
-        session.headers.update(REQUEST_HEADERS)
-        total_downloaded = 0
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = {}
+            for i, link in enumerate(links):
+                future = executor.submit(self.download_link_worker, link, save_dir)
+                futures[future] = link
+                
+            for future in as_completed(futures):
+                if self.should_stop():
+                    break
+                
+                link = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    self.log_signal.emit(f"Ошибка при обработке {link}: {e}")
+                
+                completed_links += 1
+                self.progress_signal.emit(completed_links, total_links)
 
-        for i, link in enumerate(links):
-            if self.should_stop():
-                self.log_signal.emit("-" * 30)
-                self.log_signal.emit(f"Скачивание остановлено пользователем!")
-                self.log_signal.emit(f"Скачано файлов: {total_downloaded}")
-                self.finished_signal.emit()
-                return
-
-            try:
-                downloaded = self.download_link_media(session, link, save_dir, i + 1, len(links))
-                total_downloaded += downloaded
-            except Exception as e:
-                self.log_signal.emit(f"[{i+1}/{len(links)}] Ошибка! {e}")
-
-        self.log_signal.emit("-" * 30)
-        self.log_signal.emit(f"Все загрузки завершены! Скачано файлов: {total_downloaded}")
         self.finished_signal.emit()
 
-    def download_link_media(self, session, link, save_dir, index, total):
+    def download_link_worker(self, link, save_dir):
+        session = prepare_session()
         return download_link_media(
             session,
             link,
             save_dir,
-            index,
-            total,
             self.log_signal.emit,
             self.should_stop,
         )
@@ -314,6 +395,7 @@ class DownloadThread(QThread):
 
 class SingleDownloadThread(QThread):
     log_signal = pyqtSignal(str)
+    progress_signal = pyqtSignal(int, int)
     
     def __init__(self, link):
         super().__init__()
@@ -331,18 +413,12 @@ class SingleDownloadThread(QThread):
         os.makedirs(save_dir, exist_ok=True)
         
         try:
-            session = requests.Session()
-            session.headers.update(REQUEST_HEADERS)
+            session = prepare_session()
+            self.progress_signal.emit(0, 1)
             
-            downloaded = download_link_media(session, self.link, save_dir, 1, 1, self.log_signal.emit, self.should_stop)
+            downloaded = download_link_media(session, self.link, save_dir, self.log_signal.emit, self.should_stop)
+            self.progress_signal.emit(1, 1)
             
-            if self.should_stop():
-                self.log_signal.emit("-" * 30)
-                self.log_signal.emit("Скачивание остановлено пользователем!")
-                self.log_signal.emit(f"Скачано файлов: {downloaded}")
-            else:
-                self.log_signal.emit(f"ГОТОВО! Скачано файлов: {downloaded}")
-                
         except Exception as e:
             self.log_signal.emit(f"Ошибка! {e}")
 
@@ -667,6 +743,32 @@ class NozomiDownloaderApp(QMainWindow):
         self.browser.loadFinished.connect(self.update_nav_buttons)
         self.update_nav_buttons()
 
+        artist_request_emitter.request_artist.connect(self.handle_artist_request)
+        self.artist_request_queue = []
+        self.artist_browsers = []
+        self.artist_browsers_state = {}
+        
+        for _ in range(5):
+            b = QWebEngineView(self)
+            b.hide()
+            
+            settings = b.settings()
+            settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
+            settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+            
+            b.setProperty("artist_try_count", 0)
+            b.loadFinished.connect(lambda ok, br=b: self.on_artist_page_loaded(ok, br))
+            self.artist_browsers.append(b)
+            self.artist_browsers_state[b] = None
+            
+        self.scraper_browser = QWebEngineView(self)
+        self.scraper_browser.hide()
+        scraper_settings = self.scraper_browser.settings()
+        scraper_settings.setAttribute(QWebEngineSettings.WebAttribute.AutoLoadImages, False)
+        scraper_settings.setAttribute(QWebEngineSettings.WebAttribute.PluginsEnabled, False)
+        scraper_settings.setAttribute(QWebEngineSettings.WebAttribute.JavascriptCanOpenWindows, False)
+
         main_layout.addWidget(right_panel)
 
         self.switch_tab(0)
@@ -708,6 +810,67 @@ class NozomiDownloaderApp(QMainWindow):
         else:
             self.btn_toggle_view.setIcon(get_colored_icon("icons/show.svg", "#ffffff"))
             self.btn_toggle_view.setStyleSheet("")
+
+    def handle_artist_request(self, post_url):
+        if "/post/" not in post_url:
+            return
+
+        if post_url in self.artist_browsers_state.values() or post_url in self.artist_request_queue:
+            return
+
+        self.artist_request_queue.append(post_url)
+        self.start_next_artist_request()
+
+    def start_next_artist_request(self):
+        while self.artist_request_queue:
+            free_browser = next((b for b, state in self.artist_browsers_state.items() if state is None), None)
+            if not free_browser:
+                break
+            
+            url = self.artist_request_queue.pop(0)
+            self.artist_browsers_state[free_browser] = url
+            free_browser.setProperty("artist_try_count", 0)
+            free_browser.load(QUrl(url))
+
+    def on_artist_page_loaded(self, ok, browser):
+        url = self.artist_browsers_state[browser]
+        if not ok or not url:
+            self.artist_browsers_state[browser] = None
+            self.start_next_artist_request()
+            return
+
+        self.artist_try_extract(browser)
+
+    def artist_try_extract(self, browser):
+        try_count = browser.property("artist_try_count") + 1
+        browser.setProperty("artist_try_count", try_count)
+        
+        js = """
+        (function() {
+            var nodes = document.querySelectorAll('a.artist');
+            if (!nodes || nodes.length === 0) return null;
+            return Array.prototype.map.call(nodes, function(el) { return el.innerText.trim(); });
+        })();
+        """
+        browser.page().runJavaScript(js, lambda res: self.on_artist_extract_result(res, browser))
+
+    def on_artist_extract_result(self, result, browser):
+        url = self.artist_browsers_state[browser]
+        if result and isinstance(result, list) and len(result) > 0:
+            artists = [artist for artist in result if artist]
+            artist_cache[url] = artists
+            if artists:
+                self.artist_browsers_state[browser] = None
+                self.start_next_artist_request()
+                return
+
+        try_count = browser.property("artist_try_count")
+        if try_count < 12:
+            QTimer.singleShot(700, lambda: self.artist_try_extract(browser))
+        else:
+            artist_cache[url] = []
+            self.artist_browsers_state[browser] = None
+            self.start_next_artist_request()
 
     def init_parsing_ui(self):
         from PyQt6.QtWidgets import QFrame
@@ -781,6 +944,22 @@ class NozomiDownloaderApp(QMainWindow):
         bulk_actions_layout.addWidget(self.delete_all_btn)
         layout.addLayout(bulk_actions_layout)
 
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                background-color: #1e1e1e; color: #ffffff; border: 1px solid #444; 
+                border-radius: 4px; text-align: center; font-weight: bold; height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #B52525; border-radius: 3px;
+            }
+        """)
+        self.progress_bar.setFormat("Ожидание...")
+        layout.addWidget(self.progress_bar)
+
         layout.addWidget(QLabel("Логи скачивания:"))
         self.dl_log_area = QTextEdit()
         self.dl_log_area.setReadOnly(True)
@@ -838,6 +1017,7 @@ class NozomiDownloaderApp(QMainWindow):
         thread = SingleDownloadThread(link)
         self.active_single_downloads[link] = thread
         thread.log_signal.connect(self.dl_log)
+        thread.progress_signal.connect(self.update_progress)
         thread.finished.connect(lambda l=link: self.cleanup_single_download(l))
         thread.finished.connect(self.finish_downloading)
         thread.start()
@@ -895,10 +1075,28 @@ class NozomiDownloaderApp(QMainWindow):
         self.download_btn.setEnabled(True)
         self.delete_all_btn.setEnabled(False)
         self.dl_log_area.clear()
+        self.prefetch_artists_for_links(self.links)
         self.dl_thread = DownloadThread(self.links)
         self.dl_thread.log_signal.connect(self.dl_log)
+        self.dl_thread.progress_signal.connect(self.update_progress)
         self.dl_thread.finished_signal.connect(self.finish_downloading)
         self.dl_thread.start()
+
+    def prefetch_artists_for_links(self, links):
+        for link in links:
+            if "/post/" in link:
+                clean_link = get_clean_post_url(link)
+                if clean_link not in artist_cache:
+                    artist_request_emitter.request_artist.emit(clean_link)
+
+    def update_progress(self, current, total):
+        if total > 0:
+            percent = int((current / total) * 100)
+            self.progress_bar.setValue(percent)
+            self.progress_bar.setFormat(f"Загружено: {current} / {total} ссылок ({percent}%)")
+        else:
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("Ожидание...")
 
     def log(self, text):
         self.log_area.append(format_log_text(text))
@@ -917,7 +1115,7 @@ class NozomiDownloaderApp(QMainWindow):
 
         self.is_scraping = False
         self.poll_timer.stop()
-        self.browser.stop()
+        self.scraper_browser.stop()
         self.start_btn.setText("Начать парсинг")
         self.start_btn.setEnabled(True)
         self.log("-" * 30)
@@ -941,7 +1139,7 @@ class NozomiDownloaderApp(QMainWindow):
 
         self.log("Запуск процесса...")
         self.log(f"Сгенерирована ссылка: {self.base_url}")
-        self.browser.load(QUrl(self.base_url))
+        self.scraper_browser.load(QUrl(self.base_url))
         self.poll_timer.start()
 
     def check_dom_state(self):
@@ -964,7 +1162,7 @@ class NozomiDownloaderApp(QMainWindow):
             return { 'total_pages': pages, 'links': links };
         })();
         """
-        self.browser.page().runJavaScript(js_script, self.process_js_result)
+        self.scraper_browser.page().runJavaScript(js_script, self.process_js_result)
 
     def process_js_result(self, result):
         if not self.is_scraping or result is None: return
@@ -996,7 +1194,7 @@ class NozomiDownloaderApp(QMainWindow):
             document.querySelector('#thumbnail-divs').innerHTML = '';
             window.location.hash = '#{self.current_page}';
             """
-            self.browser.page().runJavaScript(next_js)
+            self.scraper_browser.page().runJavaScript(next_js)
             self.poll_timer.start()
         else:
             self.is_scraping = False
@@ -1012,14 +1210,13 @@ class NozomiDownloaderApp(QMainWindow):
 if __name__ == "__main__":
     import ctypes
     try:
-        # Создаем уникальный ID для программы
         myappid = 'nozomi.downloader.pro.1'
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
     except Exception:
         pass
-    # ==========================================
 
     app = QApplication(sys.argv)
     window = NozomiDownloaderApp()
+    main_window = window
     window.show()
     sys.exit(app.exec())
