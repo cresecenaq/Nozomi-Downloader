@@ -24,7 +24,7 @@ jobs:
         pip install -r requirements.txt
 
     - name: Компиляция
-      run: pyinstaller --onefile --name="Nozomi Downloader" main.py
+      run: pyinstaller --onefile --name="Nozomi Downloader" --icon="app.ico" --add-data "icons;icons" main.py
 
     - name: Сохранение
       uses: actions/upload-artifact@v4
@@ -50,7 +50,7 @@ jobs:
         pip install -r requirements.txt
 
     - name: Сборка бинарника
-      run: pyinstaller --onefile main.py
+      run: pyinstaller --onefile --add-data "icons:icons" main.py
 
     - name: Подготовка appdir
       run: |
@@ -64,12 +64,13 @@ jobs:
         
         echo '[Desktop Entry]' > AppDir/main.desktop
         echo 'Type=Application' >> AppDir/main.desktop
-        echo 'Name=Application' >> AppDir/main.desktop
+        echo 'Name=Nozomi Downloader' >> AppDir/main.desktop
         echo 'Exec=main' >> AppDir/main.desktop
         echo 'Icon=main' >> AppDir/main.desktop
         echo 'Categories=Utility;' >> AppDir/main.desktop
         
-        touch AppDir/main.png
+        # Берем картинку из папки icons и кладем в корень AppDir
+        cp icons/app.png AppDir/main.png
 
     - name: Компиляция
       run: |
